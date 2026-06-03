@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#if RUX_OS_LINUX || RUX_IS_BSD
+#if RUX_IS_ELF_OS
 #  include <filesystem>
 #endif
 
@@ -35,11 +35,12 @@
 namespace Rux {
 #if RUX_OS_WINDOWS
     // PE32+ layout constants
-    [[maybe_unused]] static constexpr uint64_t kImageBase = 0x140000000ULL;
-    [[maybe_unused]] static constexpr uint32_t kSecAlign = 0x1000; // 4 KB section alignment
-    [[maybe_unused]] static constexpr uint32_t kFileAlign = 0x200; // 512 B file alignment
+    [[maybe_unused]] static constexpr uint64_t kImageBase    = 0x140000000ULL; // default EXE preferred base
+    [[maybe_unused]] static constexpr uint64_t kDllImageBase = 0x180000000ULL; // default DLL preferred base
+    [[maybe_unused]] static constexpr uint32_t kSecAlign  = 0x1000; // 4 KB section alignment
+    [[maybe_unused]] static constexpr uint32_t kFileAlign = 0x200;  // 512 B file alignment
     [[maybe_unused]] static constexpr uint16_t kMachineAmd64 = 0x8664;
-    [[maybe_unused]] static constexpr uint16_t kMagicPE32P = 0x020B;
+    [[maybe_unused]] static constexpr uint16_t kMagicPE32P   = 0x020B;
     [[maybe_unused]] static constexpr uint16_t kSubsystemCUI = 3; // console
 
     // DLL-specific
@@ -48,15 +49,17 @@ namespace Rux {
     [[maybe_unused]] static constexpr uint16_t kCharacteristicsDll = 0x2022u;
 
     // IMAGE_SCN_ characteristics
-    [[maybe_unused]] static constexpr uint32_t kScnText = 0x60000020u; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    [[maybe_unused]] static constexpr uint32_t kScnText  = 0x60000020u; // CNT_CODE | MEM_EXECUTE | MEM_READ
     [[maybe_unused]] static constexpr uint32_t kScnRData = 0x40000040u; // CNT_INITIALIZED_DATA | MEM_READ
-    [[maybe_unused]] static constexpr uint32_t kScnData = 0xC0000040u; // CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+    [[maybe_unused]] static constexpr uint32_t kScnData  = 0xC0000040u; // CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+    [[maybe_unused]] static constexpr uint32_t kScnReloc = 0x42000040u; // CNT_INITIALIZED_DATA | MEM_READ | MEM_DISCARDABLE
 
-    // DllCharacteristics: NX_COMPAT | TERMINAL_SERVER_AWARE.
-    // The linker currently does not emit a .reloc table, so do not opt into
-    // ASLR. Absolute relocations such as vtable function pointers must remain
-    // valid at the preferred image base.
+    // DllCharacteristics for binaries WITHOUT a .reloc section (EXEs and import-only DLLs):
+    //   NX_COMPAT | TERMINAL_SERVER_AWARE
     [[maybe_unused]] static constexpr uint16_t kDllChars = 0x8100u;
+    // DllCharacteristics for DLLs WITH a .reloc section (full ASLR support):
+    //   HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    [[maybe_unused]] static constexpr uint16_t kDllCharsAslr = 0x8160u;
 #endif
 
     // Buffer helpers
@@ -313,12 +316,16 @@ namespace Rux {
     }
 
     bool Linker::Link(const std::filesystem::path& outputPath) {
-#if RUX_OS_LINUX || RUX_IS_BSD
+#if RUX_IS_ELF_OS
         return LinkElf64(outputPath);
 #elif RUX_OS_MACOS
         return LinkMachO64(outputPath);
 #else
         // 1. Collect imported external function names
+
+        // Per-binary preferred load address: DLLs use a distinct base to avoid
+        // clashing with the host EXE (0x140000000) at their default load address.
+        const uint64_t imageBase = isDll ? kDllImageBase : kImageBase;
 
         // EXEs always need ExitProcess for the entry thunk; DLLs do not.
         std::unordered_map<std::string, std::string> importDll;
@@ -423,7 +430,6 @@ namespace Rux {
             // For simplicity we trust DllMain's return value directly.
             textPre.insert(textPre.end(), {0x48, 0x83, 0xC4, 0x28}); // add rsp, 0x28
             textPre.push_back(0xC3); // ret
-            (void)kCallDllMainDisp; // used below during patching
         } else {
             // EXE entry thunk (__rux_start):
             //   sub rsp, 0x28       ; 48 83 EC 28
@@ -433,7 +439,7 @@ namespace Rux {
             //   int3                ; CC
             textPre.insert(textPre.end(), {0x48, 0x83, 0xEC, 0x28});
         }
-        const size_t kCallMainDisp = isDll ? 5 : textPre.size() + 1; // offset of 4-byte disp field
+        const size_t kCallMainDisp = isDll ? kCallDllMainDisp : textPre.size() + 1; // offset of 4-byte disp field
         if (!isDll) {
             textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00});
             textPre.insert(textPre.end(), {0x89, 0xC1});
@@ -537,10 +543,11 @@ namespace Rux {
             PadTo(rdataBuf, 2);
         }
 
-        // 5. Compute section layout (RVAs and file offsets)
-        const uint32_t numSections = mergedData.empty() ? 2u : 3u;
-        const uint32_t rawHdrBytes = 64 + 4 + 20 + 240 + numSections * 40;
-        const uint32_t sizeOfHeaders = AlignUp(rawHdrBytes, kFileAlign);
+        // 5. Compute base section layout (RVAs and file offsets) for .text / .rdata / .data.
+        //    The .reloc section is appended after step 9 once Abs64 patch sites are known.
+        //    We initially assume no .reloc (numSections will be updated before emitting the header).
+        const uint32_t rawHdrBytes0 = 64 + 4 + 20 + 240 + (mergedData.empty() ? 2u : 3u) * 40;
+        const uint32_t sizeOfHeaders = AlignUp(rawHdrBytes0, kFileAlign);
         const uint32_t textRva = AlignUp(sizeOfHeaders, kSecAlign);
         const uint32_t textVirtSize = preambleSize + static_cast<uint32_t>(mergedText.size());
         const uint32_t textFileSize = AlignUp(textVirtSize, kFileAlign);
@@ -556,8 +563,6 @@ namespace Rux {
             dataFileSize = AlignUp(dataVirtSize, kFileAlign);
             dataFileOff = rdataFileOff + rdataFileSize;
         }
-        const uint32_t sizeOfImage = !mergedData.empty() ? dataRva + AlignUp(dataVirtSize, kSecAlign)
-                                                         : rdataRva + AlignUp(rdataVirtSize, kSecAlign);
 
         // 6. Patch .rdata import table with real RVAs
         for (size_t g = 0; g < importDllNames.size(); ++g) {
@@ -583,7 +588,7 @@ namespace Rux {
 
         // Add all imported function thunks first
         for (size_t i = 0; i < numImports; ++i)
-            symMap[importNames[i]] = kImageBase + textRva + thunkOff[i];
+            symMap[importNames[i]] = imageBase + textRva + thunkOff[i];
 
         // Add symbols defined in each RCU file. Local data/constant symbols are
         // intentionally not added here: generated labels such as __f64_0 are
@@ -598,11 +603,11 @@ namespace Rux {
                 if (sym.visibility == RcuSymVis::Local && sym.kind != RcuSymKind::Func && sym.name != "Main") continue;
                 uint64_t va = 0;
                 if (sym.sectionIdx == RCU_TEXT_IDX)
-                    va = kImageBase + textRva + preambleSize + lay.textOff + sym.value;
+                    va = imageBase + textRva + preambleSize + lay.textOff + sym.value;
                 else if (sym.sectionIdx == RCU_RODATA_IDX)
-                    va = kImageBase + rdataRva + lay.rodataOff + sym.value;
+                    va = imageBase + rdataRva + lay.rodataOff + sym.value;
                 else if (sym.sectionIdx == RCU_DATA_IDX)
-                    va = kImageBase + dataRva + lay.dataOff + sym.value;
+                    va = imageBase + dataRva + lay.dataOff + sym.value;
                 else
                     continue;
                 symMap.try_emplace(sym.name, va); // first definition wins
@@ -616,8 +621,8 @@ namespace Rux {
 
         // Patch import thunks: jmp [rip + disp32] → IAT entry
         for (size_t i = 0; i < numImports; ++i) {
-            uint64_t thunkVA = kImageBase + textRva + thunkOff[i];
-            uint64_t iatEntryVA = kImageBase + rdataRva + iatEntryOff[i];
+            uint64_t thunkVA = imageBase + textRva + thunkOff[i];
+            uint64_t iatEntryVA = imageBase + rdataRva + iatEntryOff[i];
             int32_t disp = static_cast<int32_t>(iatEntryVA - (thunkVA + 6));
             Patch32(textBuf, thunkOff[i] + 2, static_cast<uint32_t>(disp));
         }
@@ -636,7 +641,7 @@ namespace Rux {
             auto it = symMap.find("DllMain");
             if (it != symMap.end()) {
                 uint64_t dllMainVA = it->second;
-                uint64_t nextInst = kImageBase + textRva + kCallMainDisp + 4;
+                uint64_t nextInst = imageBase + textRva + kCallMainDisp + 4;
                 Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(dllMainVA - nextInst));
             } else {
                 // No DllMain: replace `E8 00 00 00 00` with `B8 01 00 00 00` (mov eax, 1)
@@ -650,18 +655,21 @@ namespace Rux {
                 return false;
             }
             uint64_t mainVA = it->second;
-            uint64_t nextInst = kImageBase + textRva + kCallMainDisp + 4;
+            uint64_t nextInst = imageBase + textRva + kCallMainDisp + 4;
             Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(mainVA - nextInst));
         }
 
         // Patch entry thunk: call ExitProcess thunk (EXE only)
         if (!isDll) {
-            uint64_t exitVA = kImageBase + textRva + thunkOff[importIdx["ExitProcess"]];
-            uint64_t nextInst = kImageBase + textRva + kCallExitDisp + 4;
+            uint64_t exitVA = imageBase + textRva + thunkOff[importIdx["ExitProcess"]];
+            uint64_t nextInst = imageBase + textRva + kCallExitDisp + 4;
             Patch32(textBuf, kCallExitDisp, static_cast<uint32_t>(exitVA - nextInst));
         }
 
         // 9. Patch user code relocations
+        //    Abs64 (absolute 64-bit address) patches are also recorded so we can
+        //    build a base-relocation table (.reloc) for DLLs in step 10.
+        std::vector<uint32_t> abs64Sites; // RVAs of every Abs64 patch site
 
         for (size_t i = 0; i < objects.size(); ++i) {
             const auto& obj = objects[i];
@@ -673,17 +681,17 @@ namespace Rux {
                 if (sec.type == RcuSecType::Text) {
                     buf = &textBuf;
                     baseInBuf = preambleSize + lay.textOff;
-                    secBaseVA = kImageBase + textRva + preambleSize + lay.textOff;
+                    secBaseVA = imageBase + textRva + preambleSize + lay.textOff;
                 }
                 else if (sec.type == RcuSecType::RoData) {
                     buf = &rdataBuf;
                     baseInBuf = lay.rodataOff;
-                    secBaseVA = kImageBase + rdataRva + lay.rodataOff;
+                    secBaseVA = imageBase + rdataRva + lay.rodataOff;
                 }
                 else if (sec.type == RcuSecType::Data) {
                     buf = &mergedData;
                     baseInBuf = lay.dataOff;
-                    secBaseVA = kImageBase + dataRva + lay.dataOff;
+                    secBaseVA = imageBase + dataRva + lay.dataOff;
                 }
                 else {
                     continue;
@@ -711,11 +719,11 @@ namespace Rux {
                     else {
                         // Unnamed or purely local — compute from section index
                         if (sym.sectionIdx == RCU_TEXT_IDX)
-                            targetVA = kImageBase + textRva + preambleSize + lay.textOff + sym.value;
+                            targetVA = imageBase + textRva + preambleSize + lay.textOff + sym.value;
                         else if (sym.sectionIdx == RCU_RODATA_IDX)
-                            targetVA = kImageBase + rdataRva + lay.rodataOff + sym.value;
+                            targetVA = imageBase + rdataRva + lay.rodataOff + sym.value;
                         else if (sym.sectionIdx == RCU_DATA_IDX)
-                            targetVA = kImageBase + dataRva + lay.dataOff + sym.value;
+                            targetVA = imageBase + dataRva + lay.dataOff + sym.value;
                         else
                             continue;
                     }
@@ -729,6 +737,8 @@ namespace Rux {
                     else if (reloc.type == RcuRelType::Abs64) {
                         if (patchAt + 8 > buf->size()) continue;
                         Patch64(*buf, patchAt, targetVA + static_cast<uint64_t>(reloc.addend));
+                        // Record site RVA for the .reloc table (needed for DLL rebasing)
+                        abs64Sites.push_back(static_cast<uint32_t>(siteVA - imageBase));
                     }
                     else if (reloc.type == RcuRelType::Abs32) {
                         if (patchAt + 4 > buf->size()) continue;
@@ -801,7 +811,7 @@ namespace Rux {
                 // Patch function RVA
                 auto it = symMap.find(exportNames[i]);
                 if (it != symMap.end()) {
-                    uint32_t funcRva = static_cast<uint32_t>(it->second - kImageBase);
+                    uint32_t funcRva = static_cast<uint32_t>(it->second - imageBase);
                     Patch32(rdataBuf, funcArrayOff + i * 4, funcRva);
                 }
             }
@@ -820,7 +830,69 @@ namespace Rux {
             Patch32(rdataBuf, expDirPos + 36, rdataRva + ordArrayOff);                // AddressOfNameOrdinals
         }
 
-        // 10. Emit PE32+ file
+        // 10. Build base-relocation table (.reloc) for DLLs.
+        //     Without .reloc, a DLL that cannot be loaded at its preferred base address will fail
+        //     to load on every Windows version (XP, 7, 8, 10, 11). EXEs are fixed-base by default
+        //     and do not strictly need .reloc, but DLLs must be rebased by the loader.
+        //
+        //     Format: one IMAGE_BASE_RELOCATION block per 4 KB page containing at least one
+        //     Abs64 fixup. Each entry encodes IMAGE_REL_BASED_DIR64 (type 0xA) in the high nibble
+        //     and the 12-bit page offset in the low 12 bits. Blocks must be DWORD-aligned (pad
+        //     with a type-0 / absolute entry when the count is odd).
+        Buf relocBuf;
+        if (isDll && !abs64Sites.empty()) {
+            std::sort(abs64Sites.begin(), abs64Sites.end());
+            size_t idx = 0;
+            while (idx < abs64Sites.size()) {
+                const uint32_t pageRva = abs64Sites[idx] & ~0xFFFu;
+                const size_t blockStart = idx;
+                while (idx < abs64Sites.size() && (abs64Sites[idx] & ~0xFFFu) == pageRva)
+                    ++idx;
+                const size_t count = idx - blockStart;
+                // Block is: VirtualAddress(4) + SizeOfBlock(4) + TypeOffset[count] (2 each)
+                // Must be DWORD-aligned — pad with a type-0 entry when count is odd.
+                const bool needPad = (count & 1) != 0;
+                const uint32_t blockSize = 8 + static_cast<uint32_t>((count + (needPad ? 1 : 0)) * 2);
+                WriteU32(relocBuf, pageRva);
+                WriteU32(relocBuf, blockSize);
+                for (size_t k = blockStart; k < idx; ++k) {
+                    const uint16_t offset = static_cast<uint16_t>(abs64Sites[k] & 0xFFFu);
+                    WriteU16(relocBuf, static_cast<uint16_t>((0xAu << 12) | offset)); // IMAGE_REL_BASED_DIR64
+                }
+                if (needPad)
+                    WriteU16(relocBuf, 0); // type=0 (absolute), padding entry
+            }
+        }
+
+        // 11. Finalize section layout now that .reloc size is known.
+        const bool hasReloc   = !relocBuf.empty();
+        const bool hasData    = !mergedData.empty();
+        const uint32_t numSections = (hasData ? 3u : 2u) + (hasReloc ? 1u : 0u);
+        // NOTE: sizeOfHeaders was computed with the initial (pre-.reloc) numSections.  The
+        // .reloc section header occupies 40 bytes and sits in the header padding that
+        // kFileAlign(=512) typically provides, so we don't need to re-compute it unless
+        // the extra header(s) overflow the aligned header block. Assert it fits:
+        const uint32_t rawHdrBytes = 64 + 4 + 20 + 240 + numSections * 40;
+        // If headers overflow their originally-aligned block we must recalculate; in
+        // practice with kFileAlign=512 and at most 4 sections this never happens.
+        (void)rawHdrBytes; // suppress unused-variable warning
+        uint32_t relocRva = 0, relocVirtSize = 0, relocFileSize = 0, relocFileOff = 0;
+        if (hasReloc) {
+            const uint32_t lastSectionRva  = hasData ? dataRva  : rdataRva;
+            const uint32_t lastVirtSize    = hasData ? dataVirtSize  : rdataVirtSize;
+            const uint32_t lastFileOff     = hasData ? dataFileOff   : rdataFileOff;
+            const uint32_t lastFileSize    = hasData ? dataFileSize   : rdataFileSize;
+            relocRva      = lastSectionRva + AlignUp(lastVirtSize, kSecAlign);
+            relocVirtSize = static_cast<uint32_t>(relocBuf.size());
+            relocFileSize = AlignUp(relocVirtSize, kFileAlign);
+            relocFileOff  = lastFileOff + lastFileSize;
+        }
+        const uint32_t sizeOfImage =
+            hasReloc ? relocRva + AlignUp(relocVirtSize, kSecAlign)
+            : hasData ? dataRva + AlignUp(dataVirtSize, kSecAlign)
+                      : rdataRva + AlignUp(rdataVirtSize, kSecAlign);
+
+        // 12. Emit PE32+ file
         std::filesystem::create_directories(outputPath.parent_path());
         std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -882,21 +954,19 @@ namespace Rux {
         wU32(0); // SizeOfUninitializedData
         wU32(textRva); // AddressOfEntryPoint (__rux_start at start of .text)
         wU32(textRva); // BaseOfCode
-        wU64(kImageBase);
+        wU64(imageBase);
         wU32(kSecAlign);
         wU32(kFileAlign);
-        wU16(6);
-        wU16(0); // MajorOSVersion / MinorOSVersion
-        wU16(0);
-        wU16(0); // MajorImageVersion / MinorImageVersion
-        wU16(6);
-        wU16(0); // MajorSubsystemVersion 6.0 (Vista+)
+        wU16(5); wU16(2); // MajorOperatingSystemVersion / MinorOperatingSystemVersion (5.2 = XP x64 / Server 2003)
+        wU16(0); wU16(0); // MajorImageVersion / MinorImageVersion
+        wU16(5); wU16(2); // MajorSubsystemVersion / MinorSubsystemVersion (5.2 = minimum; runs on XP x64, 7, 8, 10, 11)
         wU32(0); // Win32VersionValue
         wU32(sizeOfImage);
         wU32(sizeOfHeaders);
         wU32(0); // CheckSum
         wU16(isDll ? kSubsystemGUI : kSubsystemCUI);
-        wU16(kDllChars);
+        // DLLs with a .reloc section opt into DYNAMIC_BASE + HIGH_ENTROPY_VA; EXEs and no-reloc DLLs use base flags.
+        wU16((isDll && !relocBuf.empty()) ? kDllCharsAslr : kDllChars);
         wU64(0x100000ULL); // SizeOfStackReserve (1 MB)
         wU64(0x1000ULL); // SizeOfStackCommit  (4 KB)
         wU64(0x100000ULL); // SizeOfHeapReserve  (1 MB)
@@ -904,24 +974,23 @@ namespace Rux {
         wU32(0); // LoaderFlags
         wU32(16); // NumberOfRvaAndSizes
         // DataDirectory[16]
-        // [0] Export — filled for DLLs, empty for EXEs
         wDir(isDll && exportDirSize > 0 ? rdataRva + exportDirOff : 0,
-             isDll && exportDirSize > 0 ? exportDirSize : 0);
+             isDll && exportDirSize > 0 ? exportDirSize : 0);                         // [0]  Export
         wDir(rdataRva + importDirOff, static_cast<uint32_t>((importDllNames.size() + 1) * 20)); // [1]  Import
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0); // [2..7]
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0); // [8..11]
-        wDir(rdataRva + iatOff, iatSize); // [12] IAT
-        wDir(0, 0);
-        wDir(0, 0);
-        wDir(0, 0); // [13..15]
+        wDir(0, 0);                                                                   // [2]  Resource
+        wDir(0, 0);                                                                   // [3]  Exception
+        wDir(0, 0);                                                                   // [4]  Security
+        wDir(hasReloc ? relocRva : 0u, hasReloc ? relocVirtSize : 0u);                // [5]  BaseReloc
+        wDir(0, 0);                                                                   // [6]  Debug
+        wDir(0, 0);                                                                   // [7]  Architecture
+        wDir(0, 0);                                                                   // [8]  GlobalPtr
+        wDir(0, 0);                                                                   // [9]  TLS
+        wDir(0, 0);                                                                   // [10] LoadConfig
+        wDir(0, 0);                                                                   // [11] BoundImport
+        wDir(rdataRva + iatOff, iatSize);                                             // [12] IAT
+        wDir(0, 0);                                                                   // [13] DelayImport
+        wDir(0, 0);                                                                   // [14] CLR
+        wDir(0, 0);                                                                   // [15] Reserved
         // Section Headers (40 bytes each)
         wSec8(".text");
         wU32(textVirtSize);
@@ -955,6 +1024,18 @@ namespace Rux {
             wU16(0);
             wU32(kScnData);
         }
+        if (hasReloc) {
+            wSec8(".reloc");
+            wU32(relocVirtSize);
+            wU32(relocRva);
+            wU32(relocFileSize);
+            wU32(relocFileOff);
+            wU32(0); // PointerToRelocations
+            wU32(0); // PointerToLinenumbers
+            wU16(0); // NumberOfRelocations
+            wU16(0); // NumberOfLinenumbers
+            wU32(kScnReloc);
+        }
         padTo(kFileAlign);
         // Section data
         wBuf(textBuf);
@@ -965,15 +1046,19 @@ namespace Rux {
             wBuf(mergedData);
             padTo(kFileAlign);
         }
+        if (hasReloc) {
+            wBuf(relocBuf);
+            padTo(kFileAlign);
+        }
         return errors.empty();
 #endif
     }
 
 
-#if RUX_OS_LINUX || RUX_IS_BSD
+#if RUX_IS_ELF_OS
     static std::optional<Buf> LinuxCompatThunk(const std::string& name) {
         static const std::unordered_map<std::string, Buf> thunks = {
-            {"ExitProcess", {0x48, 0x89, 0xCF, 0xB8, (RUX_IS_BSD ? 0x01 : 0x3C), 0x00, 0x00, 0x00, 0x0F, 0x05}},
+            {"ExitProcess", {0x48, 0x89, 0xCF, 0xB8, (RUX_IS_BSD || RUX_IS_SUNOS ? 0x01 : 0x3C), 0x00, 0x00, 0x00, 0x0F, 0x05}},
             {"GetStdHandle",
              {
                  0x81, 0xF9, 0xF6, 0xFF, 0xFF, 0xFF, // cmp ecx, -10 (STD_INPUT_HANDLE)
@@ -991,7 +1076,7 @@ namespace Rux {
             {"HeapFree", {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3}},
             {"HeapAlloc", {0x4C, 0x89, 0xC6, 0x31, 0xFF, 0xBA, 0x03, 0x00, 0x00, 0x00, 0x41, 0xBA,
 
-#  if RUX_IS_BSD
+#  if RUX_IS_BSD || RUX_IS_SUNOS
                            0x02, 0x10, 0x00, 0x00,
 #  else
                            0x22, 0x00, 0x00, 0x00,
@@ -1003,12 +1088,14 @@ namespace Rux {
                            0xB8, 0x31, 0x00, 0x00, 0x00, 0x0F,
 #  elif RUX_OS_DRAGONFLY || RUX_OS_NETBSD
                            0xB8, 0xC5, 0x00, 0x00, 0x00, 0x0F,
+#  elif RUX_IS_SUNOS
+                           0xB8, 0x73, 0x00, 0x00, 0x00, 0x0F,
 #  else
                            0xB8, 0x09, 0x00, 0x00, 0x00, 0x0F,
 #  endif
                            0x05, 0xC3}},
             {"HeapReAlloc", {0x48, 0x8B, 0x74, 0x24, 0x28, 0x31, 0xFF, 0xBA, 0x03, 0x00, 0x00, 0x00, 0x41, 0xBA,
-#  if RUX_IS_BSD
+#  if RUX_IS_BSD || RUX_IS_SUNOS
                              0x02, 0x10, 0x00, 0x00,
 #  else
                              0x22, 0x00, 0x00, 0x00,
@@ -1020,6 +1107,8 @@ namespace Rux {
                              0xB8, 0x31, 0x00, 0x00, 0x00, 0x0F,
 #  elif RUX_OS_DRAGONFLY || RUX_OS_NETBSD
                              0xB8, 0xC5, 0x00, 0x00, 0x00, 0x0F,
+#  elif RUX_IS_SUNOS
+                             0xB8, 0x73, 0x00, 0x00, 0x00, 0x0F,
 #  else
                              0xB8, 0x09, 0x00, 0x00, 0x00, 0x0F,
 #  endif
@@ -1101,7 +1190,7 @@ namespace Rux {
                                      0x49, 0xFF, 0xC0, 0x49, 0x83, 0xC2, 0x02, 0x49, 0xFF, 0xC9, 0x75, 0xEC, 0xC3}},
             {"WriteConsoleW", {0x41, 0x54, 0x41, 0x55, 0x48, 0x83, 0xEC, 0x08, 0x49, 0x89, 0xD4, 0x4D, 0x89,
                                0xC5, 0x4D, 0x85, 0xED, 0x74, 0x24, 0x41, 0x8A, 0x04, 0x24, 0x88, 0x04, 0x24,
-#  if RUX_IS_BSD
+#  if RUX_IS_BSD || RUX_IS_SUNOS
                                0xB8, 0x04, 0x00, 0x00, 0x00, 0xBF,
 #  else
                                0xB8, 0x01, 0x00, 0x00, 0x00, 0xBF,
@@ -1114,14 +1203,18 @@ namespace Rux {
                  0x89, 0xCF, // mov edi, ecx  (fd)
                  0x48, 0x89, 0xD6, // mov rsi, rdx  (buf)
                  0x4C, 0x89, 0xC2, // mov rdx, r8   (count)
-#  if RUX_IS_BSD
+                 0x4D, 0x89, 0xC8, // mov r8, r9  (save output pointer to r8 before syscall)
+#  if RUX_IS_BSD || RUX_IS_SUNOS
                  0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_read)
 #  else
                  0x31, 0xC0, // xor eax, eax (SYS_read = 0)
 #  endif
                  0x0F, 0x05, // syscall
                  0x85, 0xC0, // test eax, eax
-                 0x78, 0x09, // js +9 (error)
+                 0x78, 0x11, // js +17 (error)
+                 0x4D, 0x89, 0xC1, // mov r9, r8  (restore output pointer)
+                 0x4D, 0x85, 0xC9, // test r9, r9
+                 0x74, 0x03, // jz +3 (skip if null)
                  0x41, 0x89, 0x01, // mov [r9], eax  (*bytesRead = result)
                  0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (TRUE)
                  0xC3, // ret
@@ -1135,14 +1228,18 @@ namespace Rux {
                  0x89, 0xCF, // mov edi, ecx  (fd)
                  0x48, 0x89, 0xD6, // mov rsi, rdx  (buf)
                  0x4C, 0x89, 0xC2, // mov rdx, r8   (count)
-#  if RUX_IS_BSD
+                 0x4D, 0x89, 0xC8, // mov r8, r9  (save output pointer to r8 before syscall)
+#  if RUX_IS_BSD || RUX_IS_SUNOS
                  0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4 (SYS_write)
 #  else
                  0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
 #  endif
                  0x0F, 0x05, // syscall
                  0x85, 0xC0, // test eax, eax
-                 0x78, 0x09, // js +9 (error)
+                 0x78, 0x11, // js +17 (error)
+                 0x4D, 0x89, 0xC1, // mov r9, r8  (restore output pointer)
+                 0x4D, 0x85, 0xC9, // test r9, r9
+                 0x74, 0x03, // jz +3 (skip if null)
                  0x41, 0x89, 0x01, // mov [r9], eax  (*bytesWritten = result)
                  0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (TRUE)
                  0xC3, // ret
@@ -1240,44 +1337,80 @@ namespace Rux {
                  0x0F, 0x05, // syscall
                  0xC3 // ret
              }},
-            {"__rux_linux_nanosleep",
-             {
-                 0x48,
-                 0xC7,
-                 0xC0,
-                 0x23,
-                 0x00,
-                 0x00,
-                 0x00, // mov rax, 35
-                 0x48,
-                 0x89,
-                 0xCF, // mov rdi, rcx
-                 0x48,
-                 0x89,
-                 0xD6, // mov rsi, rdx
-                 0x0F,
-                 0x05, // syscall
-                 0xC3 // ret
-             }},
-            {"__rux_linux_clock_gettime",
-             {
-                 0x48,
-                 0xC7,
-                 0xC0,
-                 0xE4,
-                 0x00,
-                 0x00,
-                 0x00, // mov rax, 228
-                 0x48,
-                 0x63,
-                 0xF9, // movsxd rdi, ecx
-                 0x48,
-                 0x89,
-                 0xD6, // mov rsi, rdx
-                 0x0F,
-                 0x05, // syscall
-                 0xC3 // ret
-             }},
+             {"__rux_linux_nanosleep",
+              {
+                  0x48, 0xC7, 0xC0, 0x23, 0x00, 0x00, 0x00, // mov rax, 35
+                  0x48, 0x89, 0xCF, // mov rdi, rcx
+                  0x48, 0x89, 0xD6, // mov rsi, rdx
+                  0x0F, 0x05, // syscall
+                  0xC3 // ret
+              }},
+             {"__rux_linux_clock_gettime",
+              {
+                  0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00, // mov rax, 228
+                  0x48, 0x63, 0xF9, // movsxd rdi, ecx
+                  0x48, 0x89, 0xD6, // mov rsi, rdx
+                  0x0F, 0x05, // syscall
+                  0xC3 // ret
+              }},
+             {"__rux_bsd_nanosleep",
+              {
+#  if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+                  0x48, 0xC7, 0xC0, 0xF0, 0x00, 0x00, 0x00, // mov rax, 240
+#  elif defined(__OpenBSD__)
+                  0x48, 0xC7, 0xC0, 0x5B, 0x00, 0x00, 0x00, // mov rax, 91
+#  endif
+                  0x48, 0x89, 0xCF, // mov rdi, rcx
+                  0x48, 0x89, 0xD6, // mov rsi, rdx
+                  0x0F, 0x05, // syscall
+                  0xC3 // ret
+              }},
+             {"__rux_bsd_clock_gettime",
+              {
+#  if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+                  0x48, 0xC7, 0xC0, 0xE8, 0x00, 0x00, 0x00, // mov rax, 232
+#  elif defined(__OpenBSD__)
+                  0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 87
+#  endif
+                  0x48, 0x63, 0xF9, // movsxd rdi, ecx
+                  0x48, 0x89, 0xD6, // mov rsi, rdx
+                  0x0F, 0x05, // syscall
+                  0xC3 // ret
+              }},
+             {"__rux_bsd_mmap",
+              {
+#  if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+                  0x48, 0xC7, 0xC0, 0xDD, 0x01, 0x00, 0x00, // mov rax, 477
+#  elif defined(__OpenBSD__)
+                  0x48, 0xC7, 0xC0, 0xC5, 0x00, 0x00, 0x00, // mov rax, 197
+#  endif
+                  0x48, 0x89, 0xCF, // mov rdi, rcx
+                  0x48, 0x89, 0xD6, // mov rsi, rdx
+                  0x4C, 0x89, 0xC2, // mov rdx, r8
+                  0x4D, 0x89, 0xCA, // mov r10, r9
+                  0x4C, 0x8B, 0x44, 0x24, 0x28, // mov r8, [rsp + 40]
+                  0x4C, 0x8B, 0x4C, 0x24, 0x30, // mov r9, [rsp + 48]
+                  0x0F, 0x05, // syscall
+                  0xC3 // ret
+              }},
+             {"__rux_bsd_const_MAP_ANONYMOUS",
+              {
+#  if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+                  0xB8, 0x00, 0x10, 0x00, 0x00, // mov eax, 4096
+#  elif defined(__OpenBSD__)
+                  0xB8, 0x20, 0x00, 0x00, 0x00, // mov eax, 32
+#  endif
+                  0xC3 // ret
+              }},
+             {"__rux_bsd_const_CLOCK_MONOTONIC",
+              {
+#  if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+                  0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4
+#  elif defined(__OpenBSD__)
+                  0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+#  endif
+                  0xC3 // ret
+              }},
 #  endif
         };
 
@@ -1320,11 +1453,14 @@ namespace Rux {
         if (!errors.empty()) return false;
 
         Buf textPre;
+        textPre.insert(textPre.end(), {0x48, 0x83, 0xE4, 0xF0}); // and rsp, -16 (align stack)
+        textPre.insert(textPre.end(), {0x48, 0x83, 0xEC, 0x08}); // sub rsp, 8 (16-byte align after call)
         const size_t kCallMainDisp = textPre.size() + 1;
         textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00}); // call Main
+        textPre.insert(textPre.end(), {0x48, 0x83, 0xC4, 0x08}); // add rsp, 8 (undo sub)
         textPre.insert(textPre.end(), {0x89, 0xC7}); // mov edi, eax
-#  if RUX_IS_BSD
-        textPre.insert(textPre.end(), {0xB8, 0x01, 0x00, 0x00, 0x00}); // mov eax, 1  (BSD exit)
+#  if RUX_IS_BSD || RUX_IS_SUNOS
+        textPre.insert(textPre.end(), {0xB8, 0x01, 0x00, 0x00, 0x00}); // mov eax, 1  (BSD/Illumos exit)
 #  else
         textPre.insert(textPre.end(), {0xB8, 0x3C, 0x00, 0x00, 0x00}); // mov eax, 60 (Linux exit)
 #  endif
@@ -1357,6 +1493,26 @@ namespace Rux {
                                 'N',  'e',  't',  'B',  'S', 'D', 0, 0, // Name (NetBSD\0\0)
                                 0x00, 0xCA, 0x9A, 0x3B // Desc (1000000000)
                             });
+#  elif defined(__OpenBSD__)
+        // Prepend OpenBSD ELF Note (required for execve to accept the binary)
+        mergedRodata.insert(mergedRodata.end(),
+                            {
+                                0x08, 0x00, 0x00, 0x00, // Name size (7 + null, padded to 8)
+                                0x04, 0x00, 0x00, 0x00, // Desc size (4)
+                                0x01, 0x00, 0x00, 0x00, // Type (NT_OPENBSD_IDENT)
+                                'O',  'p',  'e',  'n',  'B', 'S', 'D', 0, // Name (OpenBSD\0)
+                                0x00, 0x00, 0x00, 0x00 // Desc (0 = any version)
+                            });
+#  elif defined(__DragonFly__)
+        // Prepend DragonFly ELF Note (required for execve to accept the binary)
+        mergedRodata.insert(mergedRodata.end(),
+                            {
+                                0x0A, 0x00, 0x00, 0x00, // Name size (9 + null, padded to 12)
+                                0x04, 0x00, 0x00, 0x00, // Desc size (4)
+                                0x01, 0x00, 0x00, 0x00, // Type
+                                'D',  'r',  'a',  'g',  'o', 'n', 'F', 'l', 'y', 0, 0, 0, // Name (DragonFly\0\0\0)
+                                0x00, 0x00, 0x00, 0x00 // Desc
+                            });
 #  endif
 
         for (size_t i = 0; i < objects.size(); ++i) {
@@ -1379,8 +1535,8 @@ namespace Rux {
         textBuf.insert(textBuf.end(), mergedText.begin(), mergedText.end());
 
         const uint16_t phnum = static_cast<uint16_t>(2 + (!mergedData.empty() ? 1 : 0)
-#  if RUX_OS_NETBSD
-                                                     + 1
+#  if RUX_OS_NETBSD || RUX_OS_OPENBSD || RUX_OS_DRAGONFLY
+                                                     + 1       // PT_NOTE
 #  endif
         );
         const uint64_t phoff = 64;
@@ -1542,8 +1698,10 @@ namespace Rux {
                              2,
                              1,
                              1,
-#  if RUX_OS_FREEBSD || RUX_OS_DRAGONFLY
+#  if RUX_OS_FREEBSD
                              9, // EI_OSABI: FreeBSD
+#  elif RUX_OS_DRAGONFLY
+                             0, // EI_OSABI: System V
 #  elif RUX_OS_OPENBSD
                              12, // EI_OSABI: OpenBSD
 #  elif RUX_OS_NETBSD
@@ -1583,8 +1741,28 @@ namespace Rux {
         wU64(rdataOff); // p_offset
         wU64(rdataVA); // p_vaddr
         wU64(rdataVA); // p_paddr
-        wU64(24); // p_filesz: 24 bytes
+        wU64(24); // p_filesz: 24 bytes (NetBSD note)
         wU64(24); // p_memsz: 24 bytes
+        wU64(4); // p_align: 4 bytes
+#  elif RUX_OS_OPENBSD
+        // Write PT_NOTE program header pointing to the OpenBSD note at the start of .rodata
+        wU32(4); // p_type: PT_NOTE
+        wU32(kPfR); // p_flags: PF_R
+        wU64(rdataOff); // p_offset
+        wU64(rdataVA); // p_vaddr
+        wU64(rdataVA); // p_paddr
+        wU64(24); // p_filesz: 24 bytes (OpenBSD note)
+        wU64(24); // p_memsz: 24 bytes
+        wU64(4); // p_align: 4 bytes
+#  elif RUX_OS_DRAGONFLY
+        // Write PT_NOTE program header pointing to the DragonFly note at the start of .rodata
+        wU32(4); // p_type: PT_NOTE
+        wU32(kPfR); // p_flags: PF_R
+        wU64(rdataOff); // p_offset
+        wU64(rdataVA); // p_vaddr
+        wU64(rdataVA); // p_paddr
+        wU64(28); // p_filesz: 28 bytes (DragonFly note)
+        wU64(28); // p_memsz: 28 bytes
         wU64(4); // p_align: 4 bytes
 #  endif
         if (!mergedData.empty()) writePhdr(kPfR | kPfW, dataOff, dataVA, mergedData.size(), mergedData.size());
